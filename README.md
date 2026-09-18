@@ -12,7 +12,7 @@ API do assistente virtual do Residencial Aurora. O Google ADK organiza o agente 
 
 O agente principal não recebe o regulamento completo. A consulta ao regulamento é feita de forma pontual em `aurora/service.py`, e só o resultado necessário volta para a sessão.
 
-`aurora/api.py` expõe a API FastAPI. `aurora/service.py` concentra as tools de domínio e usa o apartamento guardado na sessão, nunca uma unidade mencionada no texto. `aurora/database.py` mantém a persistência SQLite e a restrição de exclusividade. Essa separação torna o modelo responsável por orientar a conversa, mas deixa autorização, cobrança, identidade e gravação exclusivamente no código.
+`aurora/adk_runtime.py` cria o `Runner` com `SqliteSessionService`; cada sessão criada pela API é espelhada no ADK com o apartamento no state e cada mensagem passa por `Runner.run_async` quando `GOOGLE_API_KEY` está configurada. `aurora/api.py` expõe a API FastAPI. `aurora/service.py` concentra as tools de domínio e usa o apartamento guardado na sessão, nunca uma unidade mencionada no texto. `aurora/database.py` mantém a persistência SQLite e a restrição de exclusividade. Essa separação torna o modelo responsável por orientar a conversa, mas deixa autorização, cobrança, identidade e gravação exclusivamente no código.
 
 ## Garantias
 

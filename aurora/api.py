@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .adk_agents import agente_principal
+from .adk_runtime import ensure_adk_session, run_adk_turn
 from .database import connect, ensure_database, initial_apartments
 from .service import answer_confirmation, assistant_message, event, pending_confirmations
 
@@ -45,7 +46,7 @@ def session_connection(session_id: str):
 
 
 @app.post("/sessoes", status_code=201)
-def create_session(payload: CreateSession):
+async def create_session(payload: CreateSession):
     if payload.apartamento not in initial_apartments():
         raise HTTPException(status_code=404, detail="Apartamento não encontrado")
     connection = connect()
@@ -53,13 +54,17 @@ def create_session(payload: CreateSession):
     connection.execute("INSERT INTO sessions(id, apartment) VALUES (?, ?)", (session_id, payload.apartamento))
     event(connection, session_id, "session_created", "sessao criada")
     connection.close()
+    await ensure_adk_session(session_id, payload.apartamento)
     return {"session_id": session_id}
 
 
 @app.post("/sessoes/{session_id}/mensagens")
-def send_message(session_id: str, payload: Message):
+async def send_message(session_id: str, payload: Message):
     connection = session_connection(session_id)
     try:
+        apartment = connection.execute("SELECT apartment FROM sessions WHERE id = ?", (session_id,)).fetchone()["apartment"]
+        adk_ran = await run_adk_turn(session_id, apartment, payload.texto)
+        event(connection, session_id, "adk_runner", "executado" if adk_ran else "indisponivel_sem_chave")
         response, pending = assistant_message(connection, session_id, payload.texto)
         return {"resposta": response, "confirmacoes_pendentes": pending}
     finally:
