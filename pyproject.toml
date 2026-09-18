@@ -1,0 +1,20 @@
+[project]
+name = "residencial-aurora"
+version = "1.0.0"
+description = "Assistente seguro do Residencial Aurora"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi==0.141.1",
+  "google-adk==2.2.0",
+  "uvicorn[standard]==0.34.2",
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["aurora"]
