@@ -1,27 +1,38 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
+from weakref import WeakValueDictionary
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictBool
 
-from .adk_agents import agente_principal
-from .adk_runtime import ensure_adk_session, run_adk_turn
+from .adk_runtime import AdkRuntime
 from .database import connect, ensure_database, initial_apartments
-from .service import answer_confirmation, assistant_message, event, pending_confirmations
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     ensure_database()
+    if not hasattr(app.state, "runtime"):
+        app.state.runtime = AdkRuntime()
     yield
 
 
 app = FastAPI(title="Residencial Aurora", lifespan=lifespan)
-# Instancia a topologia Google ADK no processo; a camada de politica abaixo e o
-# limite de autoridade para qualquer tool que o agente venha a acionar.
-_agente_principal = agente_principal
+_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def session_lock(session_id: str) -> asyncio.Lock:
+    lock = _locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[session_id] = lock
+    return lock
 
 
 class CreateSession(BaseModel):
@@ -29,82 +40,72 @@ class CreateSession(BaseModel):
 
 
 class Message(BaseModel):
-    texto: str
+    texto: str = Field(min_length=1, max_length=10000)
 
 
 class Confirmation(BaseModel):
     id: str
-    confirmado: bool
+    confirmado: StrictBool
 
 
-def session_connection(session_id: str):
-    connection = connect()
-    if connection.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
-        connection.close()
+def apartment_for_session(session_id: str) -> str:
+    with closing(connect()) as connection:
+        row = connection.execute("SELECT apartment FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if row is None:
         raise HTTPException(status_code=404, detail="Sessão não encontrada")
-    return connection
+    return row["apartment"]
 
 
 @app.post("/sessoes", status_code=201)
 async def create_session(payload: CreateSession):
     if payload.apartamento not in initial_apartments():
         raise HTTPException(status_code=404, detail="Apartamento não encontrado")
-    connection = connect()
     session_id = f"sess-{uuid.uuid4().hex}"
-    connection.execute("INSERT INTO sessions(id, apartment) VALUES (?, ?)", (session_id, payload.apartamento))
-    event(connection, session_id, "session_created", "sessao criada")
-    connection.close()
-    await ensure_adk_session(session_id, payload.apartamento)
+    await app.state.runtime.create_session(session_id, payload.apartamento)
+    with closing(connect()) as connection:
+        connection.execute("INSERT INTO sessions(id, apartment) VALUES (?, ?)", (session_id, payload.apartamento))
     return {"session_id": session_id}
 
 
 @app.post("/sessoes/{session_id}/mensagens")
 async def send_message(session_id: str, payload: Message):
-    connection = session_connection(session_id)
-    try:
-        apartment = connection.execute("SELECT apartment FROM sessions WHERE id = ?", (session_id,)).fetchone()["apartment"]
-        adk_ran = await run_adk_turn(session_id, apartment, payload.texto)
-        event(connection, session_id, "adk_runner", "executado" if adk_ran else "indisponivel_sem_chave")
-        response, pending = assistant_message(connection, session_id, payload.texto)
-        return {"resposta": response, "confirmacoes_pendentes": pending}
-    finally:
-        connection.close()
+    apartment = apartment_for_session(session_id)
+    async with session_lock(session_id):
+        try:
+            return await app.state.runtime.message(session_id, apartment, payload.texto)
+        except Exception:
+            logger.exception("Falha no Runner ADK")
+            raise HTTPException(status_code=503, detail="Assistente indisponível. Verifique a configuração do Gemini e consulte eventos e pendências antes de repetir a operação.")
 
 
 @app.post("/sessoes/{session_id}/confirmacoes")
-def confirm(session_id: str, payload: Confirmation):
-    connection = session_connection(session_id)
-    try:
-        try:
-            response, pending = answer_confirmation(connection, session_id, payload.id, payload.confirmado)
-        except ValueError:
+async def confirm(session_id: str, payload: Confirmation):
+    apartment = apartment_for_session(session_id)
+    async with session_lock(session_id):
+        if not any(p["id"] == payload.id for p in await app.state.runtime.pending(session_id, apartment)):
             raise HTTPException(status_code=409, detail="Confirmação não pendente nesta sessão")
-        return {"resposta": response, "confirmacoes_pendentes": pending}
-    finally:
-        connection.close()
+        try:
+            return await app.state.runtime.confirm(session_id, apartment, payload.id, payload.confirmado)
+        except Exception:
+            logger.exception("Falha na retomada ADK")
+            raise HTTPException(status_code=503, detail="Falha ao retomar o assistente. Consulte os eventos e dados antes de repetir a operação.")
 
 
 @app.get("/sessoes/{session_id}/eventos")
-def events(session_id: str):
-    connection = session_connection(session_id)
-    try:
-        rows = connection.execute("SELECT kind, content, created_at FROM events WHERE session_id = ? ORDER BY id", (session_id,)).fetchall()
-        return [{"tipo": row["kind"], "conteudo": row["content"], "criado_em": row["created_at"]} for row in rows]
-    finally:
-        connection.close()
+async def events(session_id: str):
+    apartment = apartment_for_session(session_id)
+    return await app.state.runtime.events(session_id, apartment)
 
 
 @app.get("/apartamentos/{apartment}/reservas")
 def reservations(apartment: str):
-    connection = connect()
-    rows = connection.execute("SELECT code, area, day FROM reservations WHERE apartment = ? ORDER BY day", (apartment,)).fetchall()
-    connection.close()
-    return [{"codigo": row["code"], "area": row["area"], "data": row["day"]} for row in rows]
+    with closing(connect()) as connection:
+        rows = connection.execute("SELECT code AS codigo, area, day AS data FROM reservations WHERE apartment=? ORDER BY day", (apartment,)).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.get("/apartamentos/{apartment}/visitantes")
 def visitors(apartment: str):
-    connection = connect()
-    rows = connection.execute("SELECT name, day FROM visitors WHERE apartment = ? ORDER BY day", (apartment,)).fetchall()
-    connection.close()
-    return [{"nome": row["name"], "data": row["day"]} for row in rows]
+    with closing(connect()) as connection:
+        rows = connection.execute("SELECT name AS nome, day AS data FROM visitors WHERE apartment=? ORDER BY day", (apartment,)).fetchall()
+    return [dict(row) for row in rows]

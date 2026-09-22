@@ -1,3 +1,4 @@
+"""Tools ADK: a conversa escolhe a operação; o código impõe a autorização."""
 from __future__ import annotations
 
 import json
@@ -5,154 +6,153 @@ import re
 import sqlite3
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from contextlib import closing
+from datetime import date
 
-from .database import areas, connect, initial_apartments
+from google.adk.tools import ToolContext
+
+from .database import DATA_DIR, areas, connect
+
+
+def apartment_for(tool_context: ToolContext) -> str:
+    """Valida o state contra o vínculo imutável criado pela API."""
+    with closing(connect()) as db:
+        row = db.execute("SELECT apartment FROM sessions WHERE id = ?", (tool_context.session.id,)).fetchone()
+    if row is None or row["apartment"] != tool_context.state.get("apartamento"):
+        raise ValueError("Identidade da sessão inválida")
+    return row["apartment"]
+
+
+def valid_date(value: str) -> bool:
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def confirmed(tool_context: ToolContext, details: dict) -> bool:
+    if tool_context.tool_confirmation is None:
+        tool_context.request_confirmation(hint="Aprove ou negue pela rota de confirmações.", payload=details)
+        tool_context.actions.skip_summarization = True
+        return False
+    return tool_context.tool_confirmation.confirmed
+
+
+def mutate(tool_context: ToolContext, operation) -> dict:
+    """Efeito e recibo da chamada são atômicos, inclusive em reexecuções."""
+    with closing(connect()) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            key = (tool_context.session.id, tool_context.function_call_id)
+            previous = db.execute("SELECT result FROM tool_results WHERE session_id=? AND call_id=?", key).fetchone()
+            if previous:
+                db.rollback()
+                return json.loads(previous["result"])
+            result = operation(db)
+            db.execute("INSERT INTO tool_results VALUES (?, ?, ?)", (*key, json.dumps(result, ensure_ascii=False)))
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
+
+
+def listar_minhas_reservas(tool_context: ToolContext) -> dict:
+    """Lista apenas as reservas do apartamento autenticado, nunca de terceiros."""
+    apartment = apartment_for(tool_context)
+    with closing(connect()) as db:
+        rows = db.execute("SELECT code AS codigo, area, day AS data FROM reservations WHERE apartment=? ORDER BY day", (apartment,)).fetchall()
+    return {"reservas": [dict(row) for row in rows]}
+
+
+def listar_meus_visitantes(tool_context: ToolContext) -> dict:
+    """Lista apenas visitantes do apartamento autenticado."""
+    apartment = apartment_for(tool_context)
+    with closing(connect()) as db:
+        rows = db.execute("SELECT name AS nome, day AS data FROM visitors WHERE apartment=? ORDER BY day", (apartment,)).fetchall()
+    return {"visitantes": [dict(row) for row in rows]}
+
+
+def consultar_disponibilidade(area: str, data: str, tool_context: ToolContext) -> dict:
+    """Consulta área por id e data ISO; revela somente disponibilidade e taxa."""
+    apartment_for(tool_context)
+    if area not in areas() or not valid_date(data):
+        return {"erro": "Informe uma área válida e data AAAA-MM-DD."}
+    with closing(connect()) as db:
+        occupied = db.execute("SELECT 1 FROM reservations WHERE area=? AND day=?", (area, data)).fetchone()
+    return {"area": area, "data": data, "livre": not bool(occupied), "taxa": areas()[area]["taxa"]}
+
+
+def reservar_area(area: str, data: str, tool_context: ToolContext) -> dict:
+    """Reserva salao-de-festas, churrasqueira ou quadra na data ISO. Taxa exige confirmação externa."""
+    apartment = apartment_for(tool_context)
+    if area not in areas() or not valid_date(data):
+        return {"erro": "Informe uma área válida e data AAAA-MM-DD."}
+    fee = areas()[area]["taxa"]
+    if fee > 0 and not confirmed(tool_context, {"area": area, "data": data, "taxa": fee}):
+        return {"status": "negada" if tool_context.tool_confirmation else "pendente"}
+
+    def write(db):
+        code = f"RSV-{uuid.uuid4().hex.upper()}"
+        while db.execute("SELECT 1 FROM issued_codes WHERE code=?", (code,)).fetchone():
+            code = f"RSV-{uuid.uuid4().hex.upper()}"
+        try:
+            db.execute("INSERT INTO reservations VALUES (?, ?, ?, ?)", (code, apartment, area, data))
+        except sqlite3.IntegrityError:
+            return {"status": "indisponivel", "area": area, "data": data}
+        db.execute("INSERT INTO issued_codes VALUES (?)", (code,))
+        return {"status": "reservada", "codigo": code, "area": area, "data": data}
+
+    return mutate(tool_context, write)
+
+
+def cancelar_reserva(area: str, data: str, tool_context: ToolContext) -> dict:
+    """Cancela reserva própria por área e data, sem confirmação. Não consulta terceiros."""
+    apartment = apartment_for(tool_context)
+    if area not in areas() or not valid_date(data):
+        return {"erro": "Informe uma área válida e data AAAA-MM-DD."}
+
+    def write(db):
+        count = db.execute("DELETE FROM reservations WHERE apartment=? AND area=? AND day=?", (apartment, area, data)).rowcount
+        return {"status": "cancelada" if count else "reserva_propria_nao_encontrada"}
+
+    return mutate(tool_context, write)
+
+
+def autorizar_visitante(nome: str, data: str, tool_context: ToolContext) -> dict:
+    """Autoriza visitante para o apartamento da sessão somente após confirmação externa."""
+    apartment = apartment_for(tool_context)
+    nome = " ".join(nome.split())
+    if not nome or len(nome) > 200 or not valid_date(data):
+        return {"erro": "Informe o nome do visitante e data AAAA-MM-DD."}
+    if not confirmed(tool_context, {"nome": nome, "data": data}):
+        return {"status": "negada" if tool_context.tool_confirmation else "pendente"}
+
+    def write(db):
+        db.execute("INSERT INTO visitors VALUES (?, ?, ?)", (apartment, nome, data))
+        return {"status": "autorizado", "nome": nome, "data": data}
+
+    return mutate(tool_context, write)
 
 
 def normalized(value: str) -> str:
-    return "".join(char for char in unicodedata.normalize("NFD", value.lower()) if unicodedata.category(char) != "Mn")
+    return "".join(c for c in unicodedata.normalize("NFD", value.lower()) if unicodedata.category(c) != "Mn")
 
 
-AREA_ALIASES = {
-    "salao-de-festas": ("salao", "festas"),
-    "churrasqueira": ("churrasqueira",),
-    "quadra": ("quadra",),
-}
-
-
-def event(connection: sqlite3.Connection, session_id: str, kind: str, content: str) -> None:
-    connection.execute("INSERT INTO events(session_id, kind, content) VALUES (?, ?, ?)", (session_id, kind, content))
-
-
-def pending_confirmations(connection: sqlite3.Connection, session_id: str) -> list[dict]:
-    rows = connection.execute(
-        "SELECT id, action, details FROM confirmations WHERE session_id = ? AND status = 'pending' ORDER BY rowid",
-        (session_id,),
-    ).fetchall()
-    return [{"id": row["id"], "acao": row["action"], "detalhes": json.loads(row["details"])} for row in rows]
-
-
-def area_in(text: str) -> str | None:
-    text = normalized(text)
-    for area, aliases in AREA_ALIASES.items():
-        if all(alias in text for alias in aliases):
-            return area
-    return None
-
-
-def day_in(text: str) -> str | None:
-    match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
-    return match.group(1) if match else None
-
-
-def create_reservation(connection: sqlite3.Connection, apartment: str, area: str, day: str) -> tuple[bool, str]:
-    code = f"RSV-{uuid.uuid4().hex[:10].upper()}"
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute("INSERT INTO issued_codes(code) VALUES (?)", (code,))
-        connection.execute("INSERT INTO reservations(code, apartment, area, day) VALUES (?, ?, ?, ?)", (code, apartment, area, day))
-        connection.execute("COMMIT")
-        return True, code
-    except sqlite3.IntegrityError:
-        connection.execute("ROLLBACK")
-        return False, ""
-
-
-def request_confirmation(connection: sqlite3.Connection, session_id: str, action: str, details: dict, payload: dict) -> dict:
-    confirmation_id = f"conf-{uuid.uuid4().hex}"
-    connection.execute(
-        "INSERT INTO confirmations(id, session_id, action, details, payload, status) VALUES (?, ?, ?, ?, ?, 'pending')",
-        (confirmation_id, session_id, action, json.dumps(details), json.dumps(payload)),
-    )
-    event(connection, session_id, "tool_confirmation_requested", f"{action}: {json.dumps(details, ensure_ascii=False)}")
-    return {"id": confirmation_id, "acao": action, "detalhes": details}
-
-
-def assistant_message(connection: sqlite3.Connection, session_id: str, text: str) -> tuple[str, list[dict]]:
-    session = connection.execute("SELECT apartment FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    if session is None:
-        raise KeyError("session")
-    apartment = session["apartment"]
-    clean = normalized(text)
-    event(connection, session_id, "user", text)
-
-    if "piscina" in clean and ("domingo" in clean or "domingos" in clean):
-        response = "A piscina fecha às 20h aos domingos e feriados."
-        event(connection, session_id, "tool_regulamento", "consulta pontual: horario da piscina aos domingos")
-        event(connection, session_id, "assistant", response)
-        return response, pending_confirmations(connection, session_id)
-
-    area, day = area_in(clean), day_in(clean)
-    if any(word in clean for word in ("cancele", "cancelar", "cancela")) and area and day:
-        deleted = connection.execute("DELETE FROM reservations WHERE apartment = ? AND area = ? AND day = ?", (apartment, area, day)).rowcount
-        response = "Reserva cancelada." if deleted else "Não encontrei uma reserva sua para cancelar."
-        event(connection, session_id, "tool_cancelar_reserva", f"area={area}; data={day}; cancelada={bool(deleted)}")
-        event(connection, session_id, "assistant", response)
-        return response, pending_confirmations(connection, session_id)
-
-    if any(word in clean for word in ("libera", "liberar", "autoriza", "autorizar")) and ("entrada" in clean or "visitante" in clean):
-        visitor = re.search(r"(?:entrada (?:do |da )?|visitante )([A-Za-zÀ-ÿ ]+?)(?: no dia| em | para )", text, re.IGNORECASE)
-        if visitor and day:
-            name = " ".join(visitor.group(1).split())
-            confirmation = request_confirmation(connection, session_id, "autorizar_visitante", {"nome": name, "data": day}, {"nome": name, "data": day})
-            return "", [confirmation]
-
-    if any(word in clean for word in ("reserve", "reservar", "reserva")) and area and day:
-        if connection.execute("SELECT 1 FROM reservations WHERE area = ? AND day = ?", (area, day)).fetchone():
-            response = "Essa área já está ocupada nessa data."
-            event(connection, session_id, "tool_consultar_disponibilidade", f"area={area}; data={day}; livre=false")
-            event(connection, session_id, "assistant", response)
-            return response, pending_confirmations(connection, session_id)
-        info = areas()[area]
-        if info["taxa"] > 0:
-            confirmation = request_confirmation(connection, session_id, "reservar_area_com_cobranca", {"area": area, "data": day}, {"area": area, "data": day})
-            return "", [confirmation]
-        created, _ = create_reservation(connection, apartment, area, day)
-        response = "Reserva realizada." if created else "Essa área já está ocupada nessa data."
-        event(connection, session_id, "tool_reservar_area", f"area={area}; data={day}; criada={created}")
-        event(connection, session_id, "assistant", response)
-        return response, pending_confirmations(connection, session_id)
-
-    if "minhas reservas" in clean or "quais reservas" in clean:
-        rows = connection.execute("SELECT area, day FROM reservations WHERE apartment = ? ORDER BY day", (apartment,)).fetchall()
-        response = "Você não possui reservas." if not rows else "Suas reservas: " + ", ".join(f"{row['area']} em {row['day']}" for row in rows) + "."
-        event(connection, session_id, "tool_listar_minhas_reservas", "consulta do apartamento da sessao")
-        event(connection, session_id, "assistant", response)
-        return response, pending_confirmations(connection, session_id)
-
-    response = "Posso ajudar com reservas, cancelamentos, visitantes e dúvidas sobre o regulamento."
-    event(connection, session_id, "assistant", response)
-    return response, pending_confirmations(connection, session_id)
-
-
-def answer_confirmation(connection: sqlite3.Connection, session_id: str, confirmation_id: str, confirmed: bool) -> tuple[str, list[dict]]:
-    connection.execute("BEGIN IMMEDIATE")
-    row = connection.execute("SELECT * FROM confirmations WHERE id = ? AND session_id = ? AND status = 'pending'", (confirmation_id, session_id)).fetchone()
-    if row is None:
-        connection.execute("ROLLBACK")
-        raise ValueError("confirmation")
-    connection.execute("UPDATE confirmations SET status = ? WHERE id = ?", ("approved" if confirmed else "denied", confirmation_id))
-    payload = json.loads(row["payload"])
-    apartment = connection.execute("SELECT apartment FROM sessions WHERE id = ?", (session_id,)).fetchone()["apartment"]
-    if not confirmed:
-        connection.execute("COMMIT")
-        response = "Ação não confirmada."
-        event(connection, session_id, "confirmation_denied", row["action"])
-        event(connection, session_id, "assistant", response)
-        return response, pending_confirmations(connection, session_id)
-    if row["action"] == "autorizar_visitante":
-        connection.execute("INSERT INTO visitors(apartment, name, day) VALUES (?, ?, ?)", (apartment, payload["nome"], payload["data"]))
-        response = "Visitante autorizado."
-    else:
-        try:
-            code = f"RSV-{uuid.uuid4().hex[:10].upper()}"
-            connection.execute("INSERT INTO issued_codes(code) VALUES (?)", (code,))
-            connection.execute("INSERT INTO reservations(code, apartment, area, day) VALUES (?, ?, ?, ?)", (code, apartment, payload["area"], payload["data"]))
-            response = "Reserva realizada."
-        except sqlite3.IntegrityError:
-            response = "Essa área já está ocupada nessa data."
-    connection.execute("COMMIT")
-    event(connection, session_id, "confirmation_approved", row["action"])
-    event(connection, session_id, "assistant", response)
-    return response, pending_confirmations(connection, session_id)
+def consultar_regulamento(assunto: str, consulta: str) -> dict:
+    """Busca artigos de UM assunto: piscina; silêncio; academia; salão de festas;
+    portaria; animais; mudanças; obras; garagem; lixo; infrações; disposições gerais.
+    consulta contém palavras específicas da dúvida. Nunca retorna outros capítulos.
+    """
+    text = (DATA_DIR / "regulamento.md").read_text(encoding="utf-8")
+    chapters = re.split(r"(?m)^## ", text)[1:]
+    terms = set(re.findall(r"[a-z0-9]+", normalized(assunto))) - {"de", "da", "do", "e", "dos", "das"}
+    ranked = [(len(terms & set(re.findall(r"[a-z0-9]+", normalized(c.splitlines()[0])))), c) for c in chapters]
+    score, chapter = max(ranked, key=lambda item: item[0], default=(0, ""))
+    if score == 0:
+        return {"erro": "Assunto não localizado. Especifique o tema da dúvida."}
+    title, body = chapter.split("\n", 1)
+    articles = [a.strip() for a in re.split(r"(?=\*\*Art\. )", body) if a.strip()]
+    words = set(re.findall(r"[a-z0-9]+", normalized(consulta))) - {"a", "o", "de", "da", "do", "e", "que", "em", "no", "na", "os", "as"}
+    selected = sorted(articles, key=lambda a: len(words & set(re.findall(r"[a-z0-9]+", normalized(a)))), reverse=True)[:2]
+    return {"fonte": "dados/regulamento.md", "capitulo": title, "trechos": selected}

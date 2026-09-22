@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 DATA_DIR = ROOT / "dados"
-RUNTIME_DIR = ROOT / ".aurora"
+RUNTIME_DIR = Path(os.getenv("AURORA_RUNTIME_DIR", str(ROOT / ".aurora"))).resolve()
 DATABASE_PATH = RUNTIME_DIR / "aurora.sqlite3"
 
 
 def connect() -> sqlite3.Connection:
-    RUNTIME_DIR.mkdir(exist_ok=True)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH, timeout=10, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -30,13 +33,6 @@ def reset_database() -> None:
           apartment TEXT NOT NULL,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id TEXT NOT NULL REFERENCES sessions(id),
-          kind TEXT NOT NULL,
-          content TEXT NOT NULL,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
         CREATE TABLE reservations (
           code TEXT PRIMARY KEY,
           apartment TEXT NOT NULL,
@@ -49,14 +45,6 @@ def reset_database() -> None:
           apartment TEXT NOT NULL,
           name TEXT NOT NULL,
           day TEXT NOT NULL
-        );
-        CREATE TABLE confirmations (
-          id TEXT PRIMARY KEY,
-          session_id TEXT NOT NULL REFERENCES sessions(id),
-          action TEXT NOT NULL,
-          details TEXT NOT NULL,
-          payload TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'denied'))
         );
         """
     )
@@ -77,6 +65,13 @@ def reset_database() -> None:
 def ensure_database() -> None:
     if not DATABASE_PATH.exists():
         reset_database()
+    connection = connect()
+    try:
+        connection.execute("""CREATE TABLE IF NOT EXISTS tool_results (
+            session_id TEXT NOT NULL, call_id TEXT NOT NULL, result TEXT NOT NULL,
+            PRIMARY KEY(session_id, call_id))""")
+    finally:
+        connection.close()
 
 
 def initial_apartments() -> set[str]:
